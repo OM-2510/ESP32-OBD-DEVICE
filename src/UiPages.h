@@ -13,7 +13,7 @@
 
 // ---- Dial radii (196px sprite, centre 98,98) ----
 constexpr int R_BEZEL = 97, R_BEZEL_IN = 93;
-constexpr int R_BAND_OUT = 91, R_BAND_IN = 85;     // thick steel / red rpm band
+constexpr int R_BAND_OUT = 91, R_BAND_IN = 85;     // thick rpm band
 constexpr int R_TICK = 82, R_NUM = 65;
 constexpr int R_HUB = 53;                          // speed ring
 constexpr int R_NEEDLE_IN = 56, R_NEEDLE_OUT = 84;
@@ -52,7 +52,7 @@ private:
   TFT_eSPI &tft;
   TFT_eSprite &face;
   TFT_eSprite &work;
-  TFT_eSprite row;                 // 308x24 off-screen row buffer (flicker-free settings rows)
+  TFT_eSprite row;                 // 308 x CFG_ROW_H off-screen row buffer (flicker-free settings rows)
   uint8_t dimS = 255;
 
   // Software dimming of the dial: sprite stays full-colour, brightness is applied while pushing
@@ -77,8 +77,8 @@ private:
   bool paramsAlertBg = false;
   int lastBarKey = -1;
 
-  // settings state
-  char rowKey[7][40];
+  // settings state (sized by CFG_ROWS - keep in sync with the menu)
+  char rowKey[CFG_ROWS][48];
   int titleKey = -1;
 
   template <class G>
@@ -129,7 +129,7 @@ public:
     resetConfigCache();
   }
 
-  bool beginRow() { row.setColorDepth(16); return row.createSprite(308, 24) != nullptr; }
+  bool beginRow() { row.setColorDepth(16); return row.createSprite(308, CFG_ROW_H) != nullptr; }
   void setDim(uint8_t s) { dimS = s; lutValid = false; }
   uint16_t D(uint16_t c) const { return dimColor(c, dimS); }
 
@@ -149,8 +149,7 @@ public:
     uint16_t bg = alert ? COL_DARKRED : TFT_BLACK;
     face.fillSprite(bg);
 
-    // Calculate all three critical angles dynamically
-    int startAng = (int)valToAngle(0, cfg.maxRpm); 
+    int startAng = (int)valToAngle(0, cfg.maxRpm);
     int redAng   = (int)valToAngle(cfg.redline, cfg.maxRpm);
     int endAng   = (int)valToAngle(cfg.maxRpm, cfg.maxRpm);
 
@@ -158,11 +157,9 @@ public:
     face.fillSmoothCircle(CX, CY, R_BEZEL_IN, bg, COL_BEZEL);
     face.drawSmoothCircle(CX, CY, R_BEZEL, COL_BEZEL_HI, COL_BEZEL);
 
-    // 1. INNER GLOW TRACK (Teal for normal range, Red for redline)
+    // inner glow track, then the outer rpm band (normal range + redline)
     face.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8, startAng, redAng, COL_TEAL_GLOW, bg, false);
     face.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8, redAng, endAng, COL_REDGLOW, bg, false);
-    
-    // 2. OUTER RPM BAND (Steel for normal range, Red for redline)
     face.drawSmoothArc(CX, CY, R_BAND_OUT, R_BAND_IN, startAng, redAng, COL_TEAL, bg, false);
     face.drawSmoothArc(CX, CY, R_BAND_OUT, R_BAND_IN, redAng, endAng, COL_REDLINE, bg, false);
 
@@ -188,7 +185,7 @@ public:
       }
     }
 
-    // Neutral gray speed ring + tiny unit labels
+    // speed ring + tiny unit labels
     face.drawSmoothCircle(CX, CY, R_HUB, COL_STEEL, bg);
     face.drawSmoothCircle(CX, CY, R_HUB - 1, COL_STEEL, bg);
     pix(face, "KM/H", CX, CY + 20, COL_LABEL, 2);
@@ -312,9 +309,10 @@ public:
     }
   }
 
-  // ================= PAGE 2: SETTINGS =================
+  // ================= PAGE 2: SETTINGS (8 rows, y = 32..236) =================
   void initConfigPage() { resetConfigCache(); }
 
+  // Only rows whose content changed are redrawn, each in one burst via the row buffer (no flicker).
   void renderConfigPage(const AppConfig &cfg, const Telemetry &t, int cursor, bool editing, bool inMenu) {
     int ts = (!inMenu ? 0 : (editing ? 2 : 1)) * 256 + dimS;
     if (ts != titleKey) {
@@ -328,20 +326,24 @@ public:
       tft.drawFastHLine(0, 28, 320, D(COL_LINE));
     }
 
-    static const char* labels[7] = {"Brightness", "Redline RPM", "Speed Correction", "Coolant Warning",
-                                    "Data Source", "Test DTC Fault", "Save & Exit"};
-    char vals[7][16];
-    snprintf(vals[0], 16, "%d %%", cfg.brightness);
-    snprintf(vals[1], 16, "%d RPM", cfg.redline);
-    snprintf(vals[2], 16, "%d %%", cfg.speedCorrPct);
-    snprintf(vals[3], 16, "%d C", cfg.warnCoolant);
-    snprintf(vals[4], 16, "%s", cfg.demoMode ? "DEMO SIM" : "LIVE OBDII");
-    snprintf(vals[5], 16, "%s", t.dtcCount > 0 ? "ACTIVE" : "CLEAR");
-    vals[6][0] = 0;
+    static const char *labels[CFG_ROWS] = {"Brightness", "Redline RPM", "Speed Correction", "Coolant Warning",
+                                           "Data Source", "Test DTC Fault", "Wifi Setup", "Save & Exit"};
+    char vals[CFG_ROWS][24];
+    snprintf(vals[ROW_BRIGHT],    24, "%d %%", cfg.brightness);
+    snprintf(vals[ROW_REDLINE],   24, "%d RPM", cfg.redline);
+    snprintf(vals[ROW_SPEEDCORR], 24, "%d %%", cfg.speedCorrPct);
+    snprintf(vals[ROW_COOLANT],   24, "%d C", cfg.warnCoolant);
+    snprintf(vals[ROW_SOURCE],    24, "%s", cfg.demoMode ? "DEMO SIM" : "LIVE OBDII");
+    snprintf(vals[ROW_DTC],       24, "%s", t.dtcCount > 0 ? "ACTIVE" : "CLEAR");
+    snprintf(vals[ROW_WIFI],      24, "%s",
+             t.wifiState == NET_ONLINE ? "ONLINE" :
+             t.wifiState == NET_CONNECTING ? "CONNECTING" :
+             t.wifiState == NET_PORTAL ? "JOIN " PORTAL_AP_NAME : "NOT SET");
+    vals[ROW_SAVE][0] = 0;
 
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < CFG_ROWS; i++) {
       bool sel = inMenu && (i == cursor), edit = sel && editing;
-      char k[40];
+      char k[48];
       snprintf(k, sizeof k, "%s|%d%d|%d", vals[i], sel, edit, dimS);
       if (strcmp(k, rowKey[i]) == 0) continue;
       strlcpy(rowKey[i], k, sizeof rowKey[i]);
@@ -350,13 +352,13 @@ public:
       row.setFreeFont(F_R9);
       row.setTextDatum(TL_DATUM);
       row.setTextColor(D(sel ? TFT_WHITE : COL_LABEL));
-      row.drawString(labels[i], 8, 5, 1);
+      row.drawString(labels[i], 8, 4, 1);
       if (vals[i][0]) {
         row.setTextDatum(TR_DATUM);
         row.setTextColor(D(sel ? (edit ? TFT_WHITE : COL_NEEDLE) : TFT_WHITE));
-        row.drawString(vals[i], 300, 5, 1);
+        row.drawString(vals[i], 300, 4, 1);
       }
-      row.pushSprite(6, 33 + i * 28);
+      row.pushSprite(6, CFG_ROW_Y0 + i * CFG_ROW_PITCH);
     }
   }
 
@@ -367,7 +369,7 @@ private:
     rpmBarKey = -1; lastBarKey = -1;
   }
   void resetConfigCache() {
-    for (int i = 0; i < 7; i++) rowKey[i][0] = 0;
+    for (int i = 0; i < CFG_ROWS; i++) rowKey[i][0] = 0;
     titleKey = -1;
   }
 
