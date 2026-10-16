@@ -40,6 +40,7 @@ void drawBluetooth();
 
 void switchPage(Page p) {
   currentPage = p;
+  obdService.setActivePage((uint8_t)p);
   tft.fillScreen(TFT_BLACK);
   if (p == PAGE_DIAL)        ui.initDialPage(cfg, tele);
   else if (p == PAGE_PARAMS) ui.initParamsPage(tele);

@@ -27,10 +27,10 @@ constexpr int SA_OUT = 129, SA_IN = 122, SA_HALF = 32;
 constexpr int PX_W = 140, PBAR_H = 7;
 struct Cell { const char *label; float lo, hi; bool center; };
 static const Cell CELLS[8] = {
-  {"COOLANT C", 40, 130, false}, {"INTAKE C", 0, 80, false},
-  {"THR %", 0, 100, false},      {"LOAD %", 0, 100, false},
-  {"MAF g/s", 0, 150, false},    {"TIMING deg", -10, 50, false},
-  {"STFT %", -25, 25, true},     {"LTFT %", -25, 25, true}
+  {"BATT (V)", 0, 15, false},     {"O2SEN (V)", 0, 1.2f, false},
+  {"COOL (C)", 0, 120, false},    {"TIM (deg)", -20, 50, false},
+  {"INTAKE (C)", 0, 80, false},   {"MAP (kPa)", 0, 105, false},
+  {"STFT (%)", -30, 30, true},    {"LTFT (%)", -30, 30, true}
 };
 
 // 3x5 pixel glyphs for the tiny dial labels (X 1 0 K M H /)
@@ -68,12 +68,11 @@ private:
   int sideKey[2] = {-1, -1};
 
   // params state
-  static constexpr int NSLOT = 10;
+  static constexpr int NSLOT = 8;
   char slotTxt[NSLOT][24];
   uint16_t slotCol[NSLOT];
   uint32_t barKey[8];
   int valPad[8];
-  int rpmBarKey = -1;
   bool paramsAlertBg = false;
   int lastBarKey = -1;
 
@@ -266,16 +265,16 @@ public:
     bool alertBg = (t.dtcCount > 0 && !t.dtcAck);
     tft.fillScreen(alertBg ? D(COL_DARKRED) : TFT_BLACK);
 
-    tft.drawFastHLine(0, 54, 320, D(COL_LINE));
-    tft.drawFastVLine(160, 56, 156, D(COL_LINE));
+    tft.drawFastHLine(0, 25, 320, D(COL_LINE));
+    tft.drawFastVLine(160, 27, 213, D(COL_LINE));
 
-    put(tft, F_R9, TL_DATUM, D(COL_ACCENT2), 10, 2, "SPEED(km/h)");
-    put(tft, F_R9, TL_DATUM, D(COL_ACCENT2), 170, 2, "ENGINE RPM");
+    put(tft, F_R9, TC_DATUM, D(COL_ACCENT2), 160, 2, "ENGINE PARAMETERS");
 
     tft.setFreeFont(F_R9);
     for (int i = 0; i < 8; i++) {
-      int cx = (i < 4) ? 10 : 170;
-      put(tft, F_R9, TL_DATUM, D(COL_LABEL), cx, 60 + (i & 3) * 40, CELLS[i].label);
+      int cx = (i % 2 == 0) ? 10 : 170;
+      int y0 = 31 + (i / 2) * 49;
+      put(tft, F_R9, TL_DATUM, D(COL_LABEL), cx, y0, CELLS[i].label);
       // value padding stops exactly where the label ends, so it can never wipe the label
       int labelEnd = cx + tft.textWidth(CELLS[i].label, 1);
       valPad[i] = max(24, cx + PX_W - labelEnd - 6);
@@ -291,23 +290,21 @@ public:
     uint16_t bg = alert ? D(COL_DARKRED) : TFT_BLACK;
     char b[24];
 
-    snprintf(b, sizeof b, "%d", t.speed);
-    drawSlot(0, b, COL_NEEDLE, bg, 10, 17, 120, TL_DATUM, F_HERO);
-    snprintf(b, sizeof b, "%d", t.rpm);
-    drawSlot(1, b, t.rpm >= cfg.redline ? COL_REDLINE : TFT_WHITE, bg, 170, 17, 120, TL_DATUM, F_HERO);
-    drawRpmBar(t.rpm, cfg);
-
-    float v[8] = {(float)t.coolant, (float)t.intake, (float)t.throttle, (float)t.load, t.maf, t.timing, t.stft, t.ltft};
+    float v[8] = {t.batteryVoltage, t.oxygenVoltage, (float)t.coolant, t.timing,
+                  (float)t.intake, (float)t.manifoldPressure, t.stft, t.ltft};
     for (int i = 0; i < 8; i++) {
-      int cx = (i < 4) ? 10 : 170, y0 = 60 + (i & 3) * 40;
+      v[i] = constrain(v[i], CELLS[i].lo, CELLS[i].hi);
+      int cx = (i % 2 == 0) ? 10 : 170;
+      int y0 = 31 + (i / 2) * 49;
       uint16_t col = COL_ACCENT, tcol = TFT_WHITE;
-      if (i == 0 && t.coolant >= cfg.warnCoolant)                         col = tcol = COL_REDLINE;
-      else if ((i == 3 && t.load >= 90) || (i >= 6 && fabsf(v[i]) > 10)) col = tcol = COL_AMBER;
+      if (i == 2 && t.coolant >= cfg.warnCoolant) col = tcol = COL_REDLINE;
+      else if ((i == 6 || i == 7) && fabsf(v[i]) > 10) col = tcol = COL_AMBER;
 
-      if (i < 4) snprintf(b, sizeof b, "%d", (int)v[i]);
-      else       snprintf(b, sizeof b, "%.1f", v[i]);
-      drawSlot(2 + i, b, tcol, bg, cx + PX_W, y0, valPad[i], TR_DATUM, F_R9);
-      drawBar(i, cx, y0 + 20, v[i], CELLS[i].lo, CELLS[i].hi, CELLS[i].center, col);
+      if (i == 0 || i == 1) snprintf(b, sizeof b, "%.2f", v[i]);
+      else if (i == 2 || i == 4 || i == 5) snprintf(b, sizeof b, "%d", (int)v[i]);
+      else snprintf(b, sizeof b, "%.1f", v[i]);
+      drawSlot(i, b, tcol, bg, cx + PX_W, y0, valPad[i], TR_DATUM, F_R9);
+      drawBar(i, cx, y0 + 25, v[i], CELLS[i].lo, CELLS[i].hi, CELLS[i].center, col);
     }
 
     // Bottom strip only appears for a DTC fault or a lost OBD link
@@ -415,7 +412,7 @@ private:
   void resetParamsCache() {
     for (int i = 0; i < NSLOT; i++) { slotTxt[i][0] = '\x01'; slotTxt[i][1] = 0; slotCol[i] = 0; }
     for (int i = 0; i < 8; i++) barKey[i] = 0xFFFFFFFF;
-    rpmBarKey = -1; lastBarKey = -1;
+    lastBarKey = -1;
   }
   void resetConfigCache() {
     for (int i = 0; i < CONFIG_ROWS; i++) rowKey[i][0] = 0;
@@ -447,20 +444,6 @@ private:
     if (b > a)    tft.fillRect(x + a, y, b - a, PBAR_H, D(col));
     if (b < PX_W) tft.fillRect(x + b, y, PX_W - b, PBAR_H, track);
     if (center)   tft.drawFastVLine(x + PX_W / 2, y - 2, PBAR_H + 4, D(COL_NUM));
-  }
-
-  void drawRpmBar(int rpm, const AppConfig &cfg) {
-    const int X = 10, Y = 41, W = 300, H = 7;
-    int fill = (int)(constrain(rpm / (float)cfg.maxRpm, 0.0f, 1.0f) * W);
-    int redX = (int)((float)cfg.redline / cfg.maxRpm * W);
-    int key = fill | (redX << 10);
-    if (key == rpmBarKey) return;
-    rpmBarKey = key;
-    int blueEnd = min(fill, redX), redEnd = max(fill, redX);
-    tft.fillRect(X, Y, blueEnd, H, D(COL_ACCENT));
-    if (redX > blueEnd) tft.fillRect(X + blueEnd, Y, redX - blueEnd, H, D(COL_TRACK));
-    if (redEnd > redX)  tft.fillRect(X + redX, Y, redEnd - redX, H, D(COL_REDLINE));
-    if (W > redEnd)     tft.fillRect(X + redEnd, Y, W - redEnd, H, D(COL_REDGLOW));
   }
 
   void drawSideStatic(bool left, const char *label) {

@@ -32,6 +32,10 @@ public:
     if (config.runDemo && !t.btConnected) runSimulator(t, config);
   }
 
+  void setActivePage(uint8_t page) {
+    activePage.store(page);
+  }
+
   void requestScan() {
     scanCount = 0;
     scanRequest = true;
@@ -75,11 +79,14 @@ private:
   std::atomic<int> selectRequest{-1};
   std::atomic<bool> scanRequest{false};
   std::atomic<bool> forgetRequest{false};
+  std::atomic<uint8_t> activePage{0};
   bool paired = false;
   bool btStarted = false;
   bool bleMemoryReleased = false;
   bool elmReady = false;
-  uint8_t pidStep = 0, fastCount = 0, nextSlow = 2;
+  static constexpr uint8_t NO_ACTIVE_PID = 0xFF;
+  uint8_t activePid = NO_ACTIVE_PID;
+  uint8_t scheduleIndex = 0;
   uint32_t lastSimMs = 0;
   int simDirection = 85;
 
@@ -262,9 +269,8 @@ private:
       return false;
     }
     elmReady = true;
-    pidStep = 0;
-    fastCount = 0;
-    nextSlow = 2;
+    activePid = NO_ACTIVE_PID;
+    scheduleIndex = 0;
     setBtState(BT_CONNECTED);
     return true;
   }
@@ -343,59 +349,112 @@ private:
   bool ok() const { return elm.nb_rx_state == ELM_SUCCESS; }
   bool finished() const { return elm.nb_rx_state != ELM_GETTING_MSG; }
 
+  uint8_t nextPid() {
+    static const uint8_t dialPids[] = {0, 1, 0, 1, 2, 3, 12};
+    static const uint8_t paramsPids[] = {11, 10, 2, 7, 4, 6, 8, 9, 12};
+    static const uint8_t otherPids[] = {12};
+
+    const uint8_t *pids = dialPids;
+    size_t count = sizeof dialPids / sizeof dialPids[0];
+    uint8_t page = activePage.load();
+    if (page == 1) {
+      pids = paramsPids;
+      count = sizeof paramsPids / sizeof paramsPids[0];
+    } else if (page != 0) {
+      pids = otherPids;
+      count = sizeof otherPids / sizeof otherPids[0];
+    }
+    if (scheduleIndex >= count) scheduleIndex = 0;
+    uint8_t pid = pids[scheduleIndex++];
+    if (scheduleIndex >= count) scheduleIndex = 0;
+    return pid;
+  }
+
   void pollElm() {
-    switch (pidStep) {
+    if (activePid == NO_ACTIVE_PID) activePid = nextPid();
+    uint8_t pid = activePid;
+    switch (pid) {
       case 0: {
         float value = elm.rpm();
-        if (ok()) tele->rpm = constrain((int)value, 0, cfg->maxRpm);
-        if (finished()) advanceFastStep(true);
+        if (finished()) {
+          if (ok()) tele->rpm = constrain((int)value, 0, cfg->maxRpm);
+          activePid = NO_ACTIVE_PID;
+        }
         break;
       }
       case 1: {
         int32_t value = elm.kph();
-        if (ok()) tele->speed = (value * cfg->speedCorrPct) / 100;
-        if (finished()) advanceFastStep(true);
+        if (finished()) {
+          if (ok()) tele->speed = (value * cfg->speedCorrPct) / 100;
+          activePid = NO_ACTIVE_PID;
+        }
         break;
       }
-      case 2: { float value = elm.engineCoolantTemp(); if (ok()) tele->coolant = (int)value; if (finished()) pidStep = 0; break; }
-      case 3: { float value = elm.engineLoad(); if (ok()) tele->load = (int)value; if (finished()) pidStep = 0; break; }
-      case 4: { float value = elm.intakeAirTemp(); if (ok()) tele->intake = (int)value; if (finished()) pidStep = 0; break; }
-      case 5: { float value = elm.throttle(); if (ok()) tele->throttle = (int)value; if (finished()) pidStep = 0; break; }
-      case 6: { float value = elm.manifoldPressure(); if (ok()) tele->maf = value; if (finished()) pidStep = 0; break; }
-      case 7: { float value = elm.timingAdvance(); if (ok()) tele->timing = value; if (finished()) pidStep = 0; break; }
-      case 8: { float value = elm.shortTermFuelTrimBank_1(); if (ok()) tele->stft = value; if (finished()) pidStep = 0; break; }
-      case 9: { float value = elm.longTermFuelTrimBank_1(); if (ok()) tele->ltft = value; if (finished()) pidStep = 0; break; }
+      case 2: {
+        float value = elm.engineCoolantTemp();
+        if (finished()) { if (ok()) tele->coolant = (int)value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 3: {
+        float value = elm.engineLoad();
+        if (finished()) { if (ok()) tele->load = (int)value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 4: {
+        float value = elm.intakeAirTemp();
+        if (finished()) { if (ok()) tele->intake = (int)value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 5: {
+        float value = elm.throttle();
+        if (finished()) { if (ok()) tele->throttle = (int)value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 6: {
+        uint8_t value = elm.manifoldPressure();
+        if (finished()) { if (ok()) tele->manifoldPressure = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 7: {
+        float value = elm.timingAdvance();
+        if (finished()) { if (ok()) tele->timing = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 8: {
+        float value = elm.shortTermFuelTrimBank_1();
+        if (finished()) { if (ok()) tele->stft = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 9: {
+        float value = elm.longTermFuelTrimBank_1();
+        if (finished()) { if (ok()) tele->ltft = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
       case 10: {
+        double value = elm.processPID(SERVICE_01, OXYGEN_SENSOR_1_A, 1, 2);
+        if (finished()) { if (ok()) tele->oxygenVoltage = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 11: {
+        float value = elm.batteryVoltage();
+        if (finished()) { if (ok()) tele->batteryVoltage = value; activePid = NO_ACTIVE_PID; }
+        break;
+      }
+      case 12: {
         uint32_t value = elm.monitorStatus();
-        if (ok()) {
-          uint8_t codes = (value >> 24) & 0x7F;
-          if (!codes) tele->dtcAck = false;
-          tele->dtcCount = codes;
+        if (finished()) {
+          if (ok()) {
+            uint8_t codes = (value >> 24) & 0x7F;
+            if (!codes) tele->dtcAck = false;
+            tele->dtcCount = codes;
+          }
+          activePid = NO_ACTIVE_PID;
         }
-        if (finished()) pidStep = 0;
         break;
       }
       default:
-        pidStep = 0;
+        activePid = NO_ACTIVE_PID;
         break;
-    }
-  }
-
-  void advanceFastStep(bool fast) {
-    if (!fast) {
-      pidStep = 0;
-      return;
-    }
-    if (pidStep == 0) {
-      pidStep = 1;
-      return;
-    }
-    if (++fastCount >= 3) {
-      fastCount = 0;
-      pidStep = nextSlow;
-      nextSlow = nextSlow >= 10 ? 2 : nextSlow + 1;
-    } else {
-      pidStep = 0;
     }
   }
 
@@ -410,9 +469,12 @@ private:
     telemetry.intake = 32 + (telemetry.rpm / 1000);
     telemetry.throttle = map(telemetry.rpm, 800, 8000, 5, 98);
     telemetry.load = map(telemetry.rpm, 800, 8000, 14, 95);
-    telemetry.maf = telemetry.rpm * 0.015f;
+    telemetry.manifoldPressure = map(telemetry.rpm, 800, 8000, 25, 95);
     telemetry.timing = 12.5f + (telemetry.rpm / 500.0f);
     telemetry.stft = -1.5f + sinf(millis() / 1000.0f) * 3.0f;
     telemetry.ltft = 2.3f;
+    telemetry.oxygenVoltage = 0.45f + sinf(millis() / 100.0f) * 0.35f;
+    telemetry.batteryVoltage = 12.6f;
+
   }
 };

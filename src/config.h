@@ -61,11 +61,13 @@ struct Telemetry {
   int coolant     = 0;
   int intake      = 0;
   int throttle    = 0;
-  float maf       = 0.0f;
+  int manifoldPressure = 0;
   float timing    = 0.0f;
   int load        = 0;
   float stft      = 0.0f;
   float ltft      = 0.0f;
+  float oxygenVoltage = 0.0f;
+  float batteryVoltage = 0.0f;
   uint8_t dtcCount = 0;
   bool dtcAck     = false;
   bool btConnected = false;
