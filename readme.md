@@ -12,7 +12,7 @@
 - **Using the Config Menu**:
   1. Turn the knob to reach the **Config Page**, then **click the knob** to enter the menu.
   2. Turn to highlight a setting, **click** to edit (row turns red), turn to adjust value, and **click** to lock it in.
-  3. Select **7. Save & Exit to Dial** to write changes to flash.
+  3. Select **Save & Exit** to write changes to flash.
 - **DTC Fault Alert**:
   - When a fault code is detected (`dtcCount > 0`), the background turns dark red (`COL_DARKRED`) and displays `"DTC FAULT! CHECK PHONE"`.
   - **Single-click the knob** while driving to acknowledge the alert—this restores the black background while keeping the red bottom warning banner visible.
@@ -25,5 +25,6 @@
 ## 4. Switching from Bench Demo to Car (`OBDII`)
 - The firmware boots in **DEMO SIM** mode by default so you can test the LFA needle, pages, and DTC red screen on your desk.
 - To connect to your car:
-  1. Turn knob to **Page 3 (Config)** -> Click `#5 Data Source` -> switch to `LIVE OBDII`.
-  2. Click `#7 Save & Exit` and reboot the ESP32 with your ELM327 plugged into the car's OBD port.
+  1. Turn the knob to **Settings** and click to enter.
+  2. Open **Bluetooth Device** -> **Search nearby devices**, then click your ELM327 adapter. Pairing uses PIN `1234`; its name and Bluetooth address are saved in ESP32 flash.
+  3. The dashboard switches to live OBD data and reconnects only to that saved adapter on later boots. Use **Remove device** before pairing a different adapter.

@@ -5,10 +5,6 @@
 #include "ObdService.h"
 #include "UiPages.h"
 
-// ============================== Core 1: UI / rendering ==============================
-// All Bluetooth, ELM327, WiFi and HTTP work lives in ObdService (two tasks pinned to Core 0).
-// This file only reads `tele`, so nothing here can be stalled by the radios.
-
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite face = TFT_eSprite(&tft);
 TFT_eSprite work = TFT_eSprite(&tft);
@@ -25,24 +21,22 @@ Page currentPage = PAGE_DIAL;
 // ---- Controls ----
 // ROTATE (outside menu) : Dial -> Params -> Settings
 // CLICK                 : Dial/Params: acknowledge DTC alert | Settings: enter menu
-// In menu               : rotate = scroll rows (wraps) / change value, click = edit on/off
-//                         click on "Wifi Setup" = start captive portal, click on "Save & Exit" = save
-//                         HOLD = save & exit
+// In menu               : rotate = scroll rows / change value, click = edit on/off, HOLD = save & exit
 bool inMenu = false;
 bool editingValue = false;
 int configCursor = 0;
+bool inBtScreen = false;
+bool showingBtResults = false;
+int btCursor = 0;
 
-// Full-quadrature counts per tactile click on this encoder (2 for most small rotary encoders).
-// One click skips/doubles a step? Try 1, 2 or 4.
-constexpr int ENC_COUNTS_PER_DETENT = 2;
+constexpr int ENC_COUNTS_PER_STEP = 1;
 constexpr unsigned long LONG_PRESS_MS = 700;
 
-int64_t lastEncCount = 0;
-int encAcc = 0;
 bool lastBtnState = false, longFired = false;
 unsigned long pressStartMs = 0, lastFrameMs = 0;
 
 void drawConfig() { ui.renderConfigPage(cfg, tele, configCursor, editingValue, inMenu); }
+void drawBluetooth();
 
 void switchPage(Page p) {
   currentPage = p;
@@ -50,6 +44,55 @@ void switchPage(Page p) {
   if (p == PAGE_DIAL)        ui.initDialPage(cfg, tele);
   else if (p == PAGE_PARAMS) ui.initParamsPage(tele);
   else { ui.initConfigPage(); drawConfig(); }
+}
+
+void enterBluetooth() {
+  inBtScreen = true;
+  showingBtResults = false;
+  btCursor = 0;
+  ui.initConfigPage();
+  drawBluetooth();
+}
+
+void leaveBluetooth() {
+  inBtScreen = false;
+  showingBtResults = false;
+  switchPage(PAGE_CONFIG);
+}
+
+void drawBluetooth() {
+  char rows[CONFIG_ROWS][48] = {};
+  const char *items[CONFIG_ROWS] = {};
+  int count = 0;
+
+  if (showingBtResults) {
+    if (tele.btState == BT_SCANNING) {
+      snprintf(rows[count++], sizeof rows[0], "Searching nearby devices...");
+    } else {
+      int nearby = obdService.nearbyCount();
+      for (int i = 0; i < nearby && count < CONFIG_ROWS - 2; i++)
+        snprintf(rows[count++], sizeof rows[0], "%s", obdService.nearbyName(i));
+      snprintf(rows[count++], sizeof rows[0], "[ Search again ]");
+      snprintf(rows[count++], sizeof rows[0], "[ Back ]");
+    }
+  } else {
+    snprintf(rows[count++], sizeof rows[0], "Saved: %s", tele.btName[0] ? tele.btName : "none");
+    const char *status = tele.btState == BT_CONNECTED ? "Connected" :
+                         tele.btState == BT_CONNECTING ? "Connecting..." :
+                         tele.btState == BT_SCANNING ? "Searching..." :
+                         tele.btState == BT_ERROR ? "Connection failed" :
+                         tele.btName[0] ? "Saved / offline" : "Not paired";
+    snprintf(rows[count++], sizeof rows[0], "Status: %s", status);
+    snprintf(rows[count++], sizeof rows[0], "[ Search nearby devices ]");
+    snprintf(rows[count++], sizeof rows[0], "%s",
+             tele.btName[0] ? "[ Remove device ]" : "[ No device to remove ]");
+    snprintf(rows[count++], sizeof rows[0], "[ Back ]");
+  }
+
+  for (int i = 0; i < count; i++) items[i] = rows[i];
+  const char *title = showingBtResults ? "BLUETOOTH  |  PIN 1234  |  CLICK TO PAIR" :
+                                         "BLUETOOTH DEVICE  |  PIN 1234";
+  ui.renderBluetoothPage(title, items, count, btCursor);
 }
 
 void saveAndExit() {
@@ -60,67 +103,106 @@ void saveAndExit() {
   switchPage(PAGE_DIAL);
 }
 
-// Signed number of whole clicks since the last call. Accumulates raw counts, so bounce and
-// fast spins can't lose or invert a click, and both directions behave identically.
-int readEncoderSteps() {
-  int64_t c = encoder.getCount();
-  int64_t d = c - lastEncCount;
-  if (d == 0) return 0;
-  lastEncCount = c;
-  encAcc += (int)d;
-  int steps = encAcc / ENC_COUNTS_PER_DETENT;        // truncates toward zero -> symmetric
-  encAcc -= steps * ENC_COUNTS_PER_DETENT;
-  return steps;
-}
-
-void applyEdit(int steps) {
-  switch (configCursor) {
-    case ROW_BRIGHT:    cfg.brightness = constrain(cfg.brightness + steps * 10, 20, 100); ui.setDim(cfg.dimScale()); break;
-    case ROW_REDLINE:   cfg.redline = constrain(cfg.redline + steps * 250, 4500, 7500); break;
-    case ROW_SPEEDCORR: cfg.speedCorrPct = constrain(cfg.speedCorrPct + steps, 85, 115); break;
-    case ROW_COOLANT:   cfg.warnCoolant = constrain(cfg.warnCoolant + steps * 2, 85, 120); break;
-    case ROW_SOURCE:    cfg.demoMode = !cfg.demoMode; break;          // applied after Save (restart)
-    case ROW_DTC:       tele.dtcCount = (tele.dtcCount > 0) ? 0 : 1; tele.dtcAck = false; break;
-    default: break;
+void onRotate(int dir) {
+  if (inBtScreen) {
+    int count;
+    if (showingBtResults) {
+      count = tele.btState == BT_SCANNING ? 1 : obdService.nearbyCount() + 2;
+    } else {
+      count = 5;
+    }
+    if (count < 1) count = 1;
+    btCursor = constrain(btCursor + dir, 0, count - 1);
+    drawBluetooth();
+    return;
   }
-}
 
-void onRotate(int steps) {
   if (currentPage == PAGE_CONFIG && inMenu) {
-    if (!editingValue) configCursor = ((configCursor + steps % CFG_ROWS) + CFG_ROWS) % CFG_ROWS;   // wraps both ways
-    else applyEdit(steps);
+    if (!editingValue) {
+      int old = configCursor;
+      configCursor = constrain(configCursor + dir, 0, CONFIG_ROWS - 1);
+      if (configCursor == old) return;
+    } else {
+      switch (configCursor) {
+        case ROW_BRIGHT:    cfg.brightness = constrain(cfg.brightness + dir * 5, 20, 100); ui.setDim(cfg.dimScale()); break;
+        case ROW_REDLINE:   cfg.redline = constrain(cfg.redline + dir * 10, 4500, 7500); break;
+        case ROW_SPEEDCORR: cfg.speedCorrPct = constrain(cfg.speedCorrPct + dir, 85, 115); break;
+        case ROW_COOLANT:   cfg.warnCoolant = constrain(cfg.warnCoolant + dir * 2, 85, 120); break;
+        case ROW_SOURCE:    cfg.demoMode = !cfg.demoMode; break;
+        case ROW_DTC:       tele.dtcCount = (tele.dtcCount > 0) ? 0 : 1; tele.dtcAck = false; break;
+      }
+    }
     drawConfig();
     return;
   }
-  int np = ((int)currentPage + steps % 3 + 3) % 3;
-  if (np != (int)currentPage) switchPage((Page)np);
+  switchPage((Page)(((int)currentPage + dir + 3) % 3));
 }
 
 void onShortPress() {
+  if (inBtScreen) {
+    if (showingBtResults) {
+      if (tele.btState == BT_SCANNING) return;
+      int nearby = obdService.nearbyCount();
+      if (btCursor < nearby) {
+        cfg.demoMode = false;
+        cfg.runDemo = false;
+        cfg.save();
+        obdService.selectDevice(btCursor);
+        showingBtResults = false;
+        btCursor = 0;
+      } else if (btCursor == nearby) {
+        obdService.requestScan();
+        btCursor = 0;
+      } else {
+        leaveBluetooth();
+        return;
+      }
+    } else {
+      if (btCursor == 2) {
+        showingBtResults = true;
+        btCursor = 0;
+        obdService.requestScan();
+      } else if (btCursor == 3 && tele.btName[0]) {
+        cfg.demoMode = true;
+        cfg.runDemo = true;
+        cfg.save();
+        obdService.forgetDevice();
+        btCursor = 0;
+      } else if (btCursor == 4) {
+        leaveBluetooth();
+        return;
+      }
+    }
+    ui.initConfigPage();
+    drawBluetooth();
+    return;
+  }
+
   if (currentPage != PAGE_CONFIG) {
     if (tele.dtcCount > 0 && !tele.dtcAck) { tele.dtcAck = true; switchPage(currentPage); }
     return;
   }
-  if (!inMenu) { inMenu = true; configCursor = 0; editingValue = false; drawConfig(); return; }
-
-  switch (configCursor) {
-    case ROW_SAVE: saveAndExit(); return;
-    case ROW_WIFI: obdService.requestWifiSetup(); break;      // portal runs on Core 0
-    default:       editingValue = !editingValue; break;
-  }
+  if (!inMenu) { inMenu = true; configCursor = 0; editingValue = false; }
+  else if (configCursor == ROW_BT) { enterBluetooth(); return; }
+  else if (configCursor == ROW_SAVE) { saveAndExit(); return; }
+  else editingValue = !editingValue;
   drawConfig();
 }
 
 void handleInput() {
-  int steps = readEncoderSteps();
-  if (steps) onRotate(steps);
+  long c = encoder.getCount();
+  if (labs(c) >= ENC_COUNTS_PER_STEP) {
+    encoder.setCount(0);
+    onRotate(c > 0 ? 1 : -1);
+  }
 
   bool btn = (digitalRead(ENC_SW) == LOW);
   unsigned long now = millis();
   if (btn && !lastBtnState) { pressStartMs = now; longFired = false; }
   if (btn && !longFired && (now - pressStartMs >= LONG_PRESS_MS)) {
     longFired = true;
-    if (currentPage == PAGE_CONFIG && inMenu) saveAndExit();
+    if (inBtScreen) leaveBluetooth();
+    else if (currentPage == PAGE_CONFIG && inMenu) saveAndExit();
   }
   if (!btn && lastBtnState && !longFired && (now - pressStartMs > 30)) onShortPress();
   lastBtnState = btn;
@@ -137,7 +219,7 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
-  // Allocate every sprite FIRST, before Bluetooth/WiFi fragment the heap
+  // Allocate all sprites FIRST (before Bluetooth fragments the heap)
   face.setColorDepth(8);
   work.setColorDepth(8);
   if (!face.createSprite(SPR, SPR) || !work.createSprite(SPR, SPR) || !ui.beginRow()) {
@@ -147,22 +229,28 @@ void setup() {
   }
   Serial.printf("Sprites ready. Free heap: %u\n", ESP.getFreeHeap());
 
-  ESP32Encoder::useInternalWeakPullResistors = puType::UP;
-  encoder.attachFullQuad(ENC_DT, ENC_CLK);
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  encoder.attachHalfQuad(ENC_DT, ENC_CLK);
   encoder.setCount(0);
   pinMode(ENC_SW, INPUT_PULLUP);
 
-  obdService.begin(&tele, &cfg);          // starts the Core 0 tasks (Bluetooth / ELM327 / WiFi / upload)
+  if (!obdService.begin(&tele, &cfg)) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Bluetooth service failed", 10, 10, 1);
+    while (true) delay(1000);
+  }
+
   switchPage(PAGE_DIAL);
 }
 
 void loop() {
   handleInput();
+  obdService.update(tele, cfg);
 
-  if (millis() - lastFrameMs < 33) { delay(1); return; }   // ~30 FPS, yields to the idle task
+  if (millis() - lastFrameMs < 33) { delay(1); return; }
   lastFrameMs = millis();
 
-  if (currentPage == PAGE_DIAL)        ui.renderDialPage(tele, cfg);
+  if (inBtScreen)                       drawBluetooth();
+  else if (currentPage == PAGE_DIAL)    ui.renderDialPage(tele, cfg);
   else if (currentPage == PAGE_PARAMS) ui.renderParamsPage(tele, cfg);
-  else                                 drawConfig();        // cheap: only changed rows are redrawn (picks up WiFi status)
 }

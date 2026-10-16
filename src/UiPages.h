@@ -13,7 +13,7 @@
 
 // ---- Dial radii (196px sprite, centre 98,98) ----
 constexpr int R_BEZEL = 97, R_BEZEL_IN = 93;
-constexpr int R_BAND_OUT = 91, R_BAND_IN = 85;     // thick rpm band
+constexpr int R_BAND_OUT = 91, R_BAND_IN = 85;     // thick steel / red rpm band
 constexpr int R_TICK = 82, R_NUM = 65;
 constexpr int R_HUB = 53;                          // speed ring
 constexpr int R_NEEDLE_IN = 56, R_NEEDLE_OUT = 84;
@@ -52,7 +52,7 @@ private:
   TFT_eSPI &tft;
   TFT_eSprite &face;
   TFT_eSprite &work;
-  TFT_eSprite row;                 // 308 x CFG_ROW_H off-screen row buffer (flicker-free settings rows)
+  TFT_eSprite row;                 // 308x24 off-screen row buffer (flicker-free settings rows)
   uint8_t dimS = 255;
 
   // Software dimming of the dial: sprite stays full-colour, brightness is applied while pushing
@@ -77,9 +77,10 @@ private:
   bool paramsAlertBg = false;
   int lastBarKey = -1;
 
-  // settings state (sized by CFG_ROWS - keep in sync with the menu)
-  char rowKey[CFG_ROWS][48];
+  // settings state
+  char rowKey[CONFIG_ROWS][64];
   int titleKey = -1;
+  char bluetoothTitle[48] = "";
 
   template <class G>
   void put(G &g, const GFXfont *f, uint8_t datum, uint16_t color, int x, int y, const char *s) {
@@ -129,7 +130,7 @@ public:
     resetConfigCache();
   }
 
-  bool beginRow() { row.setColorDepth(16); return row.createSprite(308, CFG_ROW_H) != nullptr; }
+  bool beginRow() { row.setColorDepth(16); return row.createSprite(308, 24) != nullptr; }
   void setDim(uint8_t s) { dimS = s; lutValid = false; }
   uint16_t D(uint16_t c) const { return dimColor(c, dimS); }
 
@@ -144,11 +145,36 @@ public:
     y = cy + r * cosf(rad);
   }
 
+  void drawDialTicks(TFT_eSprite &target, const AppConfig &cfg) {
+    for (int v = 0; v <= cfg.maxRpm; v += 200) {
+      float ang = valToAngle(v, cfg.maxRpm), x0, y0, x1, y1;
+      bool red = (v >= cfg.redline);
+      polar(ang, R_TICK, x0, y0);
+      if (v % 1000 == 0) {
+        polar(ang, R_TICK - 8, x1, y1);
+        target.drawWideLine(x0, y0, x1, y1, 2.5f, red ? COL_REDLINE : TFT_WHITE);
+        float nx, ny;
+        polar(ang, R_NUM, nx, ny);
+        target.setFreeFont(F_R9);
+        target.setTextDatum(MC_DATUM);
+        target.setTextColor(COL_NUM);
+        target.drawNumber(v / 1000, (int)nx, (int)ny, 1);
+      } else if (v % 500 == 0) {
+        polar(ang, R_TICK - 5, x1, y1);
+        target.drawWideLine(x0, y0, x1, y1, 1.5f, red ? COL_REDLINE : COL_NUM);
+      } else {
+        polar(ang, R_TICK - 3, x1, y1);
+        target.drawLine((int)x0, (int)y0, (int)x1, (int)y1, red ? COL_REDLINE : COL_LABEL);
+      }
+    }
+  }
+
   // ================= PAGE 0: DIAL (sprites use full-colour values; dimming happens on push) =================
   void buildLfaFace(const AppConfig &cfg, bool alert) {
     uint16_t bg = alert ? COL_DARKRED : TFT_BLACK;
     face.fillSprite(bg);
 
+    // Calculate all three critical angles dynamically
     int startAng = (int)valToAngle(0, cfg.maxRpm);
     int redAng   = (int)valToAngle(cfg.redline, cfg.maxRpm);
     int endAng   = (int)valToAngle(cfg.maxRpm, cfg.maxRpm);
@@ -157,35 +183,17 @@ public:
     face.fillSmoothCircle(CX, CY, R_BEZEL_IN, bg, COL_BEZEL);
     face.drawSmoothCircle(CX, CY, R_BEZEL, COL_BEZEL_HI, COL_BEZEL);
 
-    // inner glow track, then the outer rpm band (normal range + redline)
-    face.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8, startAng, redAng, COL_TEAL_GLOW, bg, false);
+    // The normal-range glow fills dynamically behind the needle; redline stays visible.
+    face.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8, startAng, redAng, COL_TRACK, bg, false);
     face.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8, redAng, endAng, COL_REDGLOW, bg, false);
+
+    // 2. OUTER RPM BAND (Steel for normal range, Red for redline)
     face.drawSmoothArc(CX, CY, R_BAND_OUT, R_BAND_IN, startAng, redAng, COL_TEAL, bg, false);
     face.drawSmoothArc(CX, CY, R_BAND_OUT, R_BAND_IN, redAng, endAng, COL_REDLINE, bg, false);
 
-    for (int v = 0; v <= cfg.maxRpm; v += 200) {
-      float ang = valToAngle(v, cfg.maxRpm), x0, y0, x1, y1;
-      bool red = (v >= cfg.redline);
-      polar(ang, R_TICK, x0, y0);
-      if (v % 1000 == 0) {
-        polar(ang, R_TICK - 8, x1, y1);
-        face.drawWideLine(x0, y0, x1, y1, 2.5f, red ? COL_REDLINE : TFT_WHITE);
-        float nx, ny;
-        polar(ang, R_NUM, nx, ny);
-        face.setFreeFont(F_R9);
-        face.setTextDatum(MC_DATUM);
-        face.setTextColor(COL_NUM);
-        face.drawNumber(v / 1000, (int)nx, (int)ny, 1);
-      } else if (v % 500 == 0) {
-        polar(ang, R_TICK - 5, x1, y1);
-        face.drawWideLine(x0, y0, x1, y1, 1.5f, red ? COL_REDLINE : COL_NUM);
-      } else {
-        polar(ang, R_TICK - 3, x1, y1);
-        face.drawLine((int)x0, (int)y0, (int)x1, (int)y1, red ? COL_REDLINE : COL_LABEL);
-      }
-    }
+    drawDialTicks(face, cfg);
 
-    // speed ring + tiny unit labels
+    // Neutral gray speed ring + tiny unit labels
     face.drawSmoothCircle(CX, CY, R_HUB, COL_STEEL, bg);
     face.drawSmoothCircle(CX, CY, R_HUB - 1, COL_STEEL, bg);
     pix(face, "KM/H", CX, CY + 20, COL_LABEL, 2);
@@ -227,11 +235,20 @@ public:
     if (shownRpm != lastDrawnRpm || t.speed != lastSpeed) {
       face.pushToSprite(&work, 0, 0);
 
+      float maxGlowRpm = constrain(shownRpm, 0.0f, (float)cfg.redline);
+      if (maxGlowRpm > 0.0f) {
+        work.drawSmoothArc(CX, CY, R_TICK - 2, R_NUM - 8,
+                           (int)valToAngle(0, cfg.maxRpm),
+                           (int)valToAngle(maxGlowRpm, cfg.maxRpm),
+                           COL_TEAL_GLOW, bg, false);
+      }
+      drawDialTicks(work, cfg);
+
       float a = valToAngle(shownRpm, cfg.maxRpm), x0, y0, x1, y1;
       polar(a, R_NEEDLE_IN, x0, y0);
       polar(a, R_NEEDLE_OUT, x1, y1);
-      work.drawWideLine(x0, y0, x1, y1, 3.0f, shownRpm >= cfg.redline ? COL_REDLINE : COL_NEEDLE);
-      work.drawWideLine(x0, y0, x1, y1, 1.5f, TFT_WHITE);
+      work.drawWideLine(x0, y0, x1, y1, 3.0f,
+                        shownRpm >= cfg.redline ? COL_REDLINE : TFT_WHITE);
 
       work.setFreeFont(F_R24);
       work.setTextDatum(MC_DATUM);
@@ -309,10 +326,9 @@ public:
     }
   }
 
-  // ================= PAGE 2: SETTINGS (8 rows, y = 32..236) =================
+  // ================= PAGE 2: SETTINGS =================
   void initConfigPage() { resetConfigCache(); }
 
-  // Only rows whose content changed are redrawn, each in one burst via the row buffer (no flicker).
   void renderConfigPage(const AppConfig &cfg, const Telemetry &t, int cursor, bool editing, bool inMenu) {
     int ts = (!inMenu ? 0 : (editing ? 2 : 1)) * 256 + dimS;
     if (ts != titleKey) {
@@ -326,24 +342,25 @@ public:
       tft.drawFastHLine(0, 28, 320, D(COL_LINE));
     }
 
-    static const char *labels[CFG_ROWS] = {"Brightness", "Redline RPM", "Speed Correction", "Coolant Warning",
-                                           "Data Source", "Test DTC Fault", "Wifi Setup", "Save & Exit"};
-    char vals[CFG_ROWS][24];
-    snprintf(vals[ROW_BRIGHT],    24, "%d %%", cfg.brightness);
-    snprintf(vals[ROW_REDLINE],   24, "%d RPM", cfg.redline);
-    snprintf(vals[ROW_SPEEDCORR], 24, "%d %%", cfg.speedCorrPct);
-    snprintf(vals[ROW_COOLANT],   24, "%d C", cfg.warnCoolant);
-    snprintf(vals[ROW_SOURCE],    24, "%s", cfg.demoMode ? "DEMO SIM" : "LIVE OBDII");
-    snprintf(vals[ROW_DTC],       24, "%s", t.dtcCount > 0 ? "ACTIVE" : "CLEAR");
-    snprintf(vals[ROW_WIFI],      24, "%s",
-             t.wifiState == NET_ONLINE ? "ONLINE" :
-             t.wifiState == NET_CONNECTING ? "CONNECTING" :
-             t.wifiState == NET_PORTAL ? "JOIN " PORTAL_AP_NAME : "NOT SET");
+    static const char *labels[CONFIG_ROWS] = {
+      "Brightness", "Redline RPM", "Speed Correction", "Coolant Warning",
+      "Data Source", "Test DTC Fault", "Bluetooth Device", "Save & Exit"
+    };
+    char vals[CONFIG_ROWS][28];
+    snprintf(vals[ROW_BRIGHT], sizeof vals[ROW_BRIGHT], "%d %%", cfg.brightness);
+    snprintf(vals[ROW_REDLINE], sizeof vals[ROW_REDLINE], "%d RPM", cfg.redline);
+    snprintf(vals[ROW_SPEEDCORR], sizeof vals[ROW_SPEEDCORR], "%d %%", cfg.speedCorrPct);
+    snprintf(vals[ROW_COOLANT], sizeof vals[ROW_COOLANT], "%d C", cfg.warnCoolant);
+    snprintf(vals[ROW_SOURCE], sizeof vals[ROW_SOURCE], "%s", cfg.demoMode ? "DEMO SIM" : "LIVE OBDII");
+    snprintf(vals[ROW_DTC], sizeof vals[ROW_DTC], "%s", t.dtcCount > 0 ? "ACTIVE" : "CLEAR");
+    snprintf(vals[ROW_BT], sizeof vals[ROW_BT], "%s",
+             t.btName[0] ? t.btName :
+             t.btState == BT_SCANNING ? "SEARCHING..." : "SET UP");
     vals[ROW_SAVE][0] = 0;
 
-    for (int i = 0; i < CFG_ROWS; i++) {
+    for (int i = 0; i < CONFIG_ROWS; i++) {
       bool sel = inMenu && (i == cursor), edit = sel && editing;
-      char k[48];
+      char k[64];
       snprintf(k, sizeof k, "%s|%d%d|%d", vals[i], sel, edit, dimS);
       if (strcmp(k, rowKey[i]) == 0) continue;
       strlcpy(rowKey[i], k, sizeof rowKey[i]);
@@ -352,13 +369,45 @@ public:
       row.setFreeFont(F_R9);
       row.setTextDatum(TL_DATUM);
       row.setTextColor(D(sel ? TFT_WHITE : COL_LABEL));
-      row.drawString(labels[i], 8, 4, 1);
+      row.drawString(labels[i], 8, 5, 1);
       if (vals[i][0]) {
         row.setTextDatum(TR_DATUM);
         row.setTextColor(D(sel ? (edit ? TFT_WHITE : COL_NEEDLE) : TFT_WHITE));
-        row.drawString(vals[i], 300, 4, 1);
+        row.drawString(vals[i], 300, 5, 1);
       }
-      row.pushSprite(6, CFG_ROW_Y0 + i * CFG_ROW_PITCH);
+      row.pushSprite(6, 32 + i * 25);
+    }
+  }
+
+  void renderBluetoothPage(const char *title, const char *const *items, int n, int cursor) {
+    if (strcmp(title, bluetoothTitle) != 0 || dimS != (uint8_t)(titleKey & 0xFF)) {
+      strlcpy(bluetoothTitle, title, sizeof bluetoothTitle);
+      titleKey = dimS;
+      tft.setTextPadding(300);
+      tft.setFreeFont(F_R9);
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(D(COL_ACCENT2), TFT_BLACK);
+      tft.drawString(title, 12, 6, 1);
+      tft.setTextPadding(0);
+      tft.drawFastHLine(0, 28, 320, D(COL_LINE));
+    }
+
+    for (int i = 0; i < CONFIG_ROWS; i++) {
+      bool hasItem = i < n;
+      bool selected = hasItem && i == cursor;
+      char key[64];
+      snprintf(key, sizeof key, "%s|%d|%d", hasItem ? items[i] : "", selected, dimS);
+      if (strcmp(key, rowKey[i]) == 0) continue;
+      strlcpy(rowKey[i], key, sizeof rowKey[i]);
+
+      row.fillSprite(D(selected ? COL_SEL : TFT_BLACK));
+      if (hasItem) {
+        row.setFreeFont(F_R9);
+        row.setTextDatum(TL_DATUM);
+        row.setTextColor(D(selected ? TFT_WHITE : COL_LABEL));
+        row.drawString(items[i], 8, 5, 1);
+      }
+      row.pushSprite(6, 32 + i * 25);
     }
   }
 
@@ -369,8 +418,9 @@ private:
     rpmBarKey = -1; lastBarKey = -1;
   }
   void resetConfigCache() {
-    for (int i = 0; i < CFG_ROWS; i++) rowKey[i][0] = 0;
+    for (int i = 0; i < CONFIG_ROWS; i++) rowKey[i][0] = 0;
     titleKey = -1;
+    bluetoothTitle[0] = 0;
   }
 
   void drawSlot(int i, const char *txt, uint16_t col, uint16_t bg, int x, int y, int pad, uint8_t datum, const GFXfont *font) {

@@ -1,334 +1,418 @@
 #pragma once
+
 #include <atomic>
+#include <new>
 #include <Preferences.h>
 #include <BluetoothSerial.h>
 #include <ELMduino.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiManager.h>
+#include <esp_bt.h>
 #include "Config.h"
 
-// ---------------- Build-time defaults (override with -D in platformio.ini) ----------------
-#ifndef OBD_BT_NAME
-#define OBD_BT_NAME "OBDII"                 // Bluetooth name of the ELM327 dongle
-#endif
-#ifndef OBD_BT_PIN
-#define OBD_BT_PIN "1234"                   // most clones: 1234 or 0000
-#endif
-#ifndef BACKEND_URL_DEFAULT
-#define BACKEND_URL_DEFAULT "http://192.168.1.100:5000/api/esp_telemetry"   // editable in the WiFi portal
-#endif
-#ifndef BACKEND_KEY_DEFAULT
-#define BACKEND_KEY_DEFAULT "i10-telemetry-live"                            // editable in the WiFi portal
-#endif
-#ifndef AUTO_PORTAL_IF_NO_CREDS
-#define AUTO_PORTAL_IF_NO_CREDS 0           // 1 = open the portal at boot when no WiFi is saved
-#endif
-#ifndef POST_IN_DEMO
-#define POST_IN_DEMO 1                      // 1 = also upload simulator data (handy for testing the backend)
-#endif
-constexpr uint32_t POST_INTERVAL_MS = 2000;
-constexpr uint8_t  SLOW_EVERY       = 2;    // one slow PID after every N fast (RPM+speed) cycles
+#define OBD_BT_PIN "1234"
+constexpr uint8_t BT_DEVICE_LIMIT = 6;
+constexpr uint32_t BT_SCAN_MS = 7680;
+constexpr uint32_t BT_RETRY_MAX_MS = 30000;
 
-/*
- * Core 0 worker. Two FreeRTOS tasks, both pinned to Core 0 so the 30 FPS renderer on Core 1 is never touched:
- *   obdTask (prio 2): Bluetooth link, ELM327 init, auto-reconnect, PID state machine (or simulator).
- *   netTask (prio 1): WiFi, captive portal, HTTP upload. A slow/blocked HTTP request can only stall this task;
- *                     the higher-priority obdTask preempts it, so PID polling keeps running.
- * They coordinate only through the atomic flags below. The Bluetooth stack is always started/stopped by obdTask.
- */
 class ObdService {
 public:
-  void begin(Telemetry *t, AppConfig *c) {
+  bool begin(Telemetry *t, AppConfig *c) {
     tele = t;
     cfg = c;
-    loadNetConfig();
-
-    WiFi.persistent(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin();                                   // rejoin the saved network (returns immediately)
-
-    xTaskCreatePinnedToCore(obdTrampoline, "obdTask", 8192, this, 2, nullptr, 0);
-    xTaskCreatePinnedToCore(netTrampoline, "netTask", 12288, this, 1, nullptr, 0);
+    elm.payload = nullptr;
+    elm.elm_port = nullptr;
+    loadPaired();
+    if (xTaskCreatePinnedToCore(taskEntry, "obdTask", 8192, this, 1, &task, 0) != pdPASS) {
+      Serial.println("[bt] ERROR: could not create Bluetooth/OBD task");
+      return false;
+    }
+    return true;
   }
 
-  // Called from the UI (Core 1). Returns immediately; the portal runs on Core 0.
-  void requestWifiSetup() { portalReq = true; }
+  void update(Telemetry &t, const AppConfig &config) {
+    if (config.runDemo && !t.btConnected) runSimulator(t, config);
+  }
+
+  void requestScan() {
+    scanCount = 0;
+    scanRequest = true;
+    tele->btState = BT_SCANNING;
+  }
+
+  void selectDevice(int index) {
+    selectRequest = index;
+  }
+
+  void forgetDevice() {
+    forgetRequest = true;
+  }
+
+  int nearbyCount() const {
+    return scanCount.load();
+  }
+
+  const char *nearbyName(int index) const {
+    return index >= 0 && index < scanCount.load() ? devices[index].name : "";
+  }
+
+  bool hasPairedDevice() const {
+    return tele && tele->btName[0] != '\0';
+  }
 
 private:
-  BluetoothSerial SerialBT;
+  struct Device {
+    char name[24];
+    uint8_t mac[6];
+  };
+
+  BluetoothSerial *bt = nullptr;
   ELM327 elm;
   Telemetry *tele = nullptr;
   AppConfig *cfg = nullptr;
+  TaskHandle_t task = nullptr;
+  Device devices[BT_DEVICE_LIMIT];
+  uint8_t pairedMac[6] = {};
+  std::atomic<int> scanCount{0};
+  std::atomic<int> selectRequest{-1};
+  std::atomic<bool> scanRequest{false};
+  std::atomic<bool> forgetRequest{false};
+  bool paired = false;
+  bool btStarted = false;
+  bool bleMemoryReleased = false;
+  bool elmReady = false;
+  uint8_t pidStep = 0, fastCount = 0, nextSlow = 2;
+  uint32_t lastSimMs = 0;
+  int simDirection = 85;
 
-  std::atomic<bool> portalReq{false};     // UI -> net task
-  std::atomic<bool> btReleaseReq{false};  // net task -> obd task ("drop Bluetooth now")
-  std::atomic<bool> btReleased{false};    // obd task -> net task ("Bluetooth is off")
+  static void taskEntry(void *arg) {
+    static_cast<ObdService *>(arg)->taskLoop();
+    vTaskDelete(nullptr);
+  }
 
-  bool btStarted = false, elmReady = false;
-  char url[112] = BACKEND_URL_DEFAULT;
-  char key[48]  = BACKEND_KEY_DEFAULT;
+  void setBtState(uint8_t state) {
+    tele->btState = state;
+    tele->btConnected = state == BT_CONNECTED;
+  }
 
-  uint8_t pidStep = 0, fastCount = 0, nextSlow = 2, errCount = 0;
-  unsigned long lastSimMs = 0;
-  int simDir = 85;
+  bool startBluetooth() {
+    if (btStarted) return true;
+    if (!bt) {
+      bt = new (std::nothrow) BluetoothSerial();
+      if (!bt) {
+        Serial.println("[bt] ERROR: Bluetooth object allocation failed");
+        return false;
+      }
+    }
+    if (!bleMemoryReleased) {
+      esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+      if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.printf("[bt] BLE memory release failed: %s\n", esp_err_to_name(err));
+      }
+      bleMemoryReleased = true;
+    }
+    if (!bt->begin("ESP32_OBD_Dash", true)) {
+      Serial.printf("[bt] ERROR: Bluetooth start failed (heap=%u)\n", ESP.getFreeHeap());
+      delete bt;
+      bt = nullptr;
+      return false;
+    }
+    bt->setPin(OBD_BT_PIN);
+    btStarted = true;
+    return true;
+  }
 
-  static void obdTrampoline(void *a) { ((ObdService *)a)->obdLoop(); vTaskDelete(nullptr); }
-  static void netTrampoline(void *a) { ((ObdService *)a)->netLoop(); vTaskDelete(nullptr); }
+  void restartBluetooth() {
+    elmReady = false;
+    elm.elm_port = nullptr;
+    tele->btConnected = false;
+    if (bt) {
+      delete bt;
+      bt = nullptr;
+    }
+    btStarted = false;
+  }
 
-  // =====================================================================================
-  //                                   OBD TASK (Core 0)
-  // =====================================================================================
-  void obdLoop() {
+  void loadPaired() {
+    Preferences prefs;
+    if (!prefs.begin("bt", true)) return;
+    paired = prefs.getBytes("mac", pairedMac, sizeof pairedMac) == sizeof pairedMac;
+    if (paired && prefs.isKey("name")) {
+      String name = prefs.getString("name");
+      strlcpy(tele->btName, name.c_str(), sizeof tele->btName);
+    }
+    prefs.end();
+    setBtState(paired ? BT_CONNECTING : BT_NOT_PAIRED);
+  }
+
+  bool savePaired(const Device &device) {
+    Preferences prefs;
+    if (!prefs.begin("bt", false)) {
+      Serial.println("[bt] ERROR: could not open pairing storage");
+      return false;
+    }
+    size_t macBytes = prefs.putBytes("mac", device.mac, sizeof device.mac);
+    size_t nameBytes = prefs.putString("name", device.name);
+    prefs.end();
+    if (macBytes != sizeof device.mac || nameBytes == 0) {
+      Serial.println("[bt] ERROR: could not persist selected Bluetooth device");
+      return false;
+    }
+    memcpy(pairedMac, device.mac, sizeof pairedMac);
+    strlcpy(tele->btName, device.name, sizeof tele->btName);
+    paired = true;
+    return true;
+  }
+
+  void removePaired() {
+    if (bt && btStarted && paired) bt->unpairDevice(pairedMac);
+    restartBluetooth();
+    Preferences prefs;
+    if (prefs.begin("bt", false)) {
+      prefs.remove("mac");
+      prefs.remove("name");
+      prefs.end();
+    } else {
+      Serial.println("[bt] ERROR: could not open pairing storage to remove device");
+    }
+    memset(pairedMac, 0, sizeof pairedMac);
+    tele->btName[0] = '\0';
+    paired = false;
+    setBtState(BT_NOT_PAIRED);
+    Serial.println("[bt] saved device removed");
+  }
+
+  int scanNearby() {
+    restartBluetooth();
+    if (!startBluetooth()) return -1;
+
+    BTScanResults *results = bt->discover(BT_SCAN_MS);
+    int found = 0;
+    if (results) {
+      int total = results->getCount();
+      for (int i = 0; i < total && found < BT_DEVICE_LIMIT; i++) {
+        BTAdvertisedDevice *device = results->getDevice(i);
+        if (!device) continue;
+        BTAddress address = device->getAddress();
+        memcpy(devices[found].mac, *address.getNative(), sizeof devices[found].mac);
+        std::string name = device->getName();
+        strlcpy(devices[found].name,
+                name.empty() ? address.toString(true).c_str() : name.c_str(),
+                sizeof devices[found].name);
+        found++;
+      }
+    }
+    scanCount.store(found);
+    Serial.printf("[bt] scan complete: %d device(s)\n", found);
+    return found;
+  }
+
+  bool elmCommand(const char *command, uint32_t timeoutMs, bool expectOk = false) {
+    elm.timeout_ms = timeoutMs;
+    elm.sendCommand(command);
+    uint32_t start = millis();
+    while (elm.nb_rx_state == ELM_GETTING_MSG && millis() - start <= timeoutMs) {
+      elm.get_response();
+      if (elm.nb_rx_state == ELM_GETTING_MSG) vTaskDelay(1);
+    }
+    return elm.nb_rx_state == ELM_SUCCESS &&
+           (!expectOk || strstr(elm.payload, "OK") != nullptr);
+  }
+
+  bool initializeElm() {
+    elm.elm_port = bt;
+    elm.PAYLOAD_LEN = 128;
+    elm.debugMode = false;
+    elm.timeout_ms = 2000;
+    if (!elm.payload) elm.payload = static_cast<char *>(malloc(elm.PAYLOAD_LEN + 1));
+    if (!elm.payload) {
+      Serial.println("[obd] ERROR: ELM response buffer allocation failed");
+      return false;
+    }
+
+    uint32_t start = millis();
+    if (!elmCommand(SET_ALL_TO_DEFAULTS, 2000, true)) return false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!elmCommand(RESET_ALL, 3000)) return false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!elmCommand(ECHO_OFF, 2000, true)) return false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!elmCommand(PRINTING_SPACES_OFF, 2000, true)) return false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!elmCommand(ALLOW_LONG_MESSAGES, 2000, true)) return false;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!elmCommand("AT ST 00", 2000, true)) return false;
+    if (!elmCommand("AT SP A0", 2000, true)) return false;
+    if (!elmCommand("0100", 30000)) return false;
+
+    elm.connected = true;
+    elm.timeout_ms = 2000;
+    elmCommand(HEADERS_OFF, 1000, true);
+    elmCommand(LINEFEEDS_OFF, 1000, true);
+    Serial.printf("[obd] ELM ready in %u ms\n", (unsigned)(millis() - start));
+    return true;
+  }
+
+  bool connectSavedDevice() {
+    if (!startBluetooth()) return false;
+    setBtState(BT_CONNECTING);
+    Serial.printf("[bt] reconnecting saved device: %s\n", tele->btName);
+    if (!bt->connect(pairedMac)) return false;
+    if (!initializeElm()) {
+      Serial.println("[obd] ELM327 initialization failed");
+      bt->disconnect();
+      return false;
+    }
+    elmReady = true;
+    pidStep = 0;
+    fastCount = 0;
+    nextSlow = 2;
+    setBtState(BT_CONNECTED);
+    return true;
+  }
+
+  void taskLoop() {
     uint32_t retryMs = 1000;
-    uint8_t fails = 0;
+    uint32_t nextConnect = 0;
 
     for (;;) {
-      if (btReleaseReq) { releaseBt(); vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // WiFi portal needs the radio
-      btReleased = false;
+      if (forgetRequest.exchange(false)) {
+        removePaired();
+        retryMs = 1000;
+        continue;
+      }
 
-      if (cfg->runDemo) { runSimulator(); vTaskDelay(pdMS_TO_TICKS(40)); continue; }
+      if (scanRequest.exchange(false)) {
+        setBtState(BT_SCANNING);
+        int found = scanNearby();
+        if (found < 0) setBtState(BT_ERROR);
+        else setBtState(paired ? BT_CONNECTING : BT_NOT_PAIRED);
+        continue;
+      }
 
-      // ---- (re)connect + ELM327 init ----
+      int selected = selectRequest.exchange(-1);
+      if (selected >= 0) {
+        if (selected < scanCount.load()) {
+          if (bt && btStarted && paired) bt->unpairDevice(pairedMac);
+          restartBluetooth();
+          if (savePaired(devices[selected])) {
+            Serial.printf("[bt] saved device: %s\n", tele->btName);
+            retryMs = 1000;
+            nextConnect = 0;
+          } else {
+            setBtState(BT_ERROR);
+          }
+        }
+      }
+
+      if (!paired) {
+        if (!scanRequest) setBtState(BT_NOT_PAIRED);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+
       if (!elmReady) {
-        tele->btConnected = false;
-        if (connectAndInit()) {
-          elmReady = true;
-          tele->btConnected = true;
-          fails = 0; retryMs = 1000;
-          resetPollState();
-          Serial.printf("ELM327 ready. Free heap: %u\n", ESP.getFreeHeap());
+        uint32_t now = millis();
+        if ((int32_t)(now - nextConnect) < 0) {
+          vTaskDelay(pdMS_TO_TICKS(100));
+          continue;
+        }
+        if (connectSavedDevice()) {
+          retryMs = 1000;
         } else {
-          if (++fails >= 4) { stopBt(); fails = 0; }            // every 4th failure: full Bluetooth stack restart
-          vTaskDelay(pdMS_TO_TICKS(retryMs));
-          retryMs = (retryMs * 2 > 15000) ? 15000 : retryMs * 2;  // 1s, 2s, 4s, 8s, 15s ...
+          setBtState(BT_ERROR);
+          Serial.printf("[bt] connection failed; retry in %u s\n", (unsigned)(retryMs / 1000));
+          nextConnect = millis() + retryMs;
+          retryMs = retryMs >= BT_RETRY_MAX_MS / 2 ? BT_RETRY_MAX_MS : retryMs * 2;
+          vTaskDelay(pdMS_TO_TICKS(100));
         }
         continue;
       }
 
-      // ---- link watchdog ----
-      if (!SerialBT.connected()) {
-        Serial.println("Bluetooth link lost - reconnecting");
+      if (!bt || !bt->connected()) {
         elmReady = false;
         tele->btConnected = false;
+        setBtState(BT_CONNECTING);
+        nextConnect = millis();
         continue;
       }
 
-      // ---- non-blocking PID polling ----
       pollElm();
-      if (errCount >= 8) {                                      // ECU silent (ignition off?): show zeros, slow down
-        tele->rpm = 0;
-        tele->speed = 0;
-        vTaskDelay(pdMS_TO_TICKS(250));
-      }
-      if (errCount >= 40) { elmReady = false; errCount = 0; }   // dongle probably hung: redo the handshake
-      vTaskDelay(pdMS_TO_TICKS(2));                             // yield every cycle
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
 
-  bool connectAndInit() {
-    if (!btStarted) {
-      if (!SerialBT.begin("ESP32_OBD_Dash", true)) return false;   // master mode
-      SerialBT.setPin(OBD_BT_PIN);
-      btStarted = true;
-    }
-    if (SerialBT.connected()) SerialBT.disconnect();               // clean slate
-    if (!SerialBT.connect(OBD_BT_NAME)) return false;              // blocks this task only (it yields)
-    if (btReleaseReq) return false;
-    if (!initElm()) { SerialBT.disconnect(); return false; }
-    return true;
-  }
-
-  // Cooperative handshake: proves the dongle answers before ELMduino's own (blocking) init runs.
-  bool initElm() {
-    if (!atCommand("ATZ", 3500, false)) return false;              // reset, wait for the '>' prompt
-    if (!elm.begin(SerialBT, false, 2000)) return false;           // ELMduino AT init (echo off, spaces off, protocol)
-    atCommand("ATH0", 1000, true);                                 // headers off  (best effort)
-    atCommand("ATL0", 1000, true);                                 // linefeeds off (best effort)
-    return true;
-  }
-
-  // Sends one AT command and waits for the ELM327 '>' prompt. Polls the UART every 5 ms with vTaskDelay,
-  // so it never busy-waits, and aborts at once if a Bluetooth release is requested.
-  bool atCommand(const char *cmd, uint32_t timeoutMs, bool needOk) {
-    while (SerialBT.available()) SerialBT.read();
-    SerialBT.print(cmd);
-    SerialBT.print('\r');
-
-    char buf[48];
-    size_t n = 0;
-    for (uint32_t t0 = millis(); millis() - t0 < timeoutMs;) {
-      if (btReleaseReq) return false;
-      while (SerialBT.available()) {
-        char ch = (char)SerialBT.read();
-        if (ch == '>') { buf[n] = 0; return !needOk || strstr(buf, "OK") != nullptr; }
-        if (n < sizeof(buf) - 1) buf[n++] = ch;
-      }
-      vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    return false;
-  }
-
-  void stopBt() {
-    if (btStarted) { SerialBT.end(); btStarted = false; }
-    elmReady = false;
-    tele->btConnected = false;
-  }
-  void releaseBt() { stopBt(); btReleased = true; }
-
-  // ---- PID state machine: 0=RPM 1=Speed (fast) | 2..10 slow sensors, interleaved ----
-  bool ok()       { return elm.nb_rx_state == ELM_SUCCESS; }
-  bool finished() { return elm.nb_rx_state != ELM_GETTING_MSG; }
-
-  void resetPollState() { pidStep = 0; fastCount = 0; nextSlow = 2; errCount = 0; }
-
-  void onDone(bool success, bool fast) {
-    if (!fast) { pidStep = 0; return; }
-    errCount = success ? 0 : (errCount < 255 ? errCount + 1 : 255);
-    if (pidStep == 0) pidStep = 1;                                  // RPM is always followed by speed
-    else if (++fastCount >= SLOW_EVERY) {                           // then one slow sensor every N cycles
-      fastCount = 0;
-      pidStep = nextSlow;
-      nextSlow = (nextSlow >= 10) ? 2 : nextSlow + 1;
-    } else pidStep = 0;
-  }
+  bool ok() const { return elm.nb_rx_state == ELM_SUCCESS; }
+  bool finished() const { return elm.nb_rx_state != ELM_GETTING_MSG; }
 
   void pollElm() {
     switch (pidStep) {
-      case 0:  { float v = elm.rpm();   if (ok()) tele->rpm = constrain((int)v, 0, cfg->maxRpm);       if (finished()) onDone(ok(), true);  break; }
-      case 1:  { int32_t v = elm.kph(); if (ok()) tele->speed = (v * cfg->speedCorrPct) / 100;         if (finished()) onDone(ok(), true);  break; }
-      case 2:  { float v = elm.engineCoolantTemp();       if (ok()) tele->coolant  = (int)v; if (finished()) onDone(ok(), false); break; }
-      case 3:  { float v = elm.engineLoad();              if (ok()) tele->load     = (int)v; if (finished()) onDone(ok(), false); break; }
-      case 4:  { float v = elm.intakeAirTemp();           if (ok()) tele->intake   = (int)v; if (finished()) onDone(ok(), false); break; }
-      case 5:  { float v = elm.throttle();                if (ok()) tele->throttle = (int)v; if (finished()) onDone(ok(), false); break; }
-      case 6:  { float v = elm.mafRate();                 if (ok()) tele->maf      = v;      if (finished()) onDone(ok(), false); break; }
-      case 7:  { float v = elm.timingAdvance();           if (ok()) tele->timing   = v;      if (finished()) onDone(ok(), false); break; }
-      case 8:  { float v = elm.shortTermFuelTrimBank_1(); if (ok()) tele->stft     = v;      if (finished()) onDone(ok(), false); break; }
-      case 9:  { float v = elm.longTermFuelTrimBank_1();  if (ok()) tele->ltft     = v;      if (finished()) onDone(ok(), false); break; }
-      case 10: {                                                  // PID 01 01: byte A = MIL bit + DTC count
-        uint32_t v = elm.monitorStatus();
-        if (ok()) {
-          uint8_t codes = (v >> 24) & 0x7F;
-          if (codes == 0) tele->dtcAck = false;
-          tele->dtcCount = codes;
-        }
-        if (finished()) onDone(ok(), false);
+      case 0: {
+        float value = elm.rpm();
+        if (ok()) tele->rpm = constrain((int)value, 0, cfg->maxRpm);
+        if (finished()) advanceFastStep(true);
         break;
       }
-      default: pidStep = 0; break;
+      case 1: {
+        int32_t value = elm.kph();
+        if (ok()) tele->speed = (value * cfg->speedCorrPct) / 100;
+        if (finished()) advanceFastStep(true);
+        break;
+      }
+      case 2: { float value = elm.engineCoolantTemp(); if (ok()) tele->coolant = (int)value; if (finished()) pidStep = 0; break; }
+      case 3: { float value = elm.engineLoad(); if (ok()) tele->load = (int)value; if (finished()) pidStep = 0; break; }
+      case 4: { float value = elm.intakeAirTemp(); if (ok()) tele->intake = (int)value; if (finished()) pidStep = 0; break; }
+      case 5: { float value = elm.throttle(); if (ok()) tele->throttle = (int)value; if (finished()) pidStep = 0; break; }
+      case 6: { float value = elm.manifoldPressure(); if (ok()) tele->maf = value; if (finished()) pidStep = 0; break; }
+      case 7: { float value = elm.timingAdvance(); if (ok()) tele->timing = value; if (finished()) pidStep = 0; break; }
+      case 8: { float value = elm.shortTermFuelTrimBank_1(); if (ok()) tele->stft = value; if (finished()) pidStep = 0; break; }
+      case 9: { float value = elm.longTermFuelTrimBank_1(); if (ok()) tele->ltft = value; if (finished()) pidStep = 0; break; }
+      case 10: {
+        uint32_t value = elm.monitorStatus();
+        if (ok()) {
+          uint8_t codes = (value >> 24) & 0x7F;
+          if (!codes) tele->dtcAck = false;
+          tele->dtcCount = codes;
+        }
+        if (finished()) pidStep = 0;
+        break;
+      }
+      default:
+        pidStep = 0;
+        break;
     }
   }
 
-  void runSimulator() {
+  void advanceFastStep(bool fast) {
+    if (!fast) {
+      pidStep = 0;
+      return;
+    }
+    if (pidStep == 0) {
+      pidStep = 1;
+      return;
+    }
+    if (++fastCount >= 3) {
+      fastCount = 0;
+      pidStep = nextSlow;
+      nextSlow = nextSlow >= 10 ? 2 : nextSlow + 1;
+    } else {
+      pidStep = 0;
+    }
+  }
+
+  void runSimulator(Telemetry &telemetry, const AppConfig &config) {
     if (millis() - lastSimMs < 40) return;
     lastSimMs = millis();
-    Telemetry &t = *tele;
-    t.rpm += simDir;
-    if (t.rpm >= 7600) simDir = -110;
-    if (t.rpm <= 800)  simDir = 85;
-    t.speed    = ((t.rpm / 45) * cfg->speedCorrPct) / 100;
-    t.coolant  = 86 + (t.rpm / 600);
-    t.intake   = 32 + (t.rpm / 1000);
-    t.throttle = map(t.rpm, 800, 8000, 5, 98);
-    t.load     = map(t.rpm, 800, 8000, 14, 95);
-    t.maf      = t.rpm * 0.015f;
-    t.timing   = 12.5f + (t.rpm / 500.0f);
-    t.stft     = -1.5f + sinf(millis() / 1000.0f) * 3.0f;
-    t.ltft     = 2.3f;
-  }
-
-  // =====================================================================================
-  //                                   NETWORK TASK (Core 0)
-  // =====================================================================================
-  void netLoop() {
-    uint32_t lastPost = 0, backoff = 0, lastCredCheck = 0;
-    bool hasCreds = WiFi.SSID().length() > 0;
-    bool autoPortalDone = false;
-
-    for (;;) {
-      if (portalReq) { runPortal(); hasCreds = WiFi.SSID().length() > 0; continue; }
-
-      if (millis() - lastCredCheck > 2000) { lastCredCheck = millis(); hasCreds = WiFi.SSID().length() > 0; }
-#if AUTO_PORTAL_IF_NO_CREDS
-      if (!autoPortalDone && !hasCreds) { autoPortalDone = true; portalReq = true; continue; }
-#endif
-      (void)autoPortalDone;
-
-      bool online = (WiFi.status() == WL_CONNECTED);
-      tele->wifiState = online ? NET_ONLINE : (hasCreds ? NET_CONNECTING : NET_OFF);
-
-      if (online && (POST_IN_DEMO || !cfg->runDemo) && millis() - lastPost >= POST_INTERVAL_MS + backoff) {
-        lastPost = millis();
-        if (postTelemetry()) backoff = 0;
-        else backoff = (backoff + 2000 > 16000) ? 16000 : backoff + 2000;   // back off while the server is unreachable
-      }
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
-  }
-
-  // Blocking only inside this task. Short timeouts keep it responsive; obdTask is never affected.
-  bool postTelemetry() {
-    Telemetry s = *tele;                                           // quick snapshot
-    char body[224];
-    int n = snprintf(body, sizeof body,
-      "{\"RPM\":%d,\"SPEED\":%d,\"LOAD\":%d,\"COOLANT\":%d,\"THROTTLE\":%d,\"INTAKE\":%d,"
-      "\"MAF\":%.1f,\"TIMING\":%.1f,\"STFT\":%.1f,\"LTFT\":%.1f,\"DTC\":%u}",
-      s.rpm, s.speed, s.load, s.coolant, s.throttle, s.intake, s.maf, s.timing, s.stft, s.ltft, s.dtcCount);
-
-    HTTPClient http;
-    http.setConnectTimeout(1500);
-    http.setTimeout(1500);
-    http.setReuse(false);
-    if (!http.begin(url)) return false;
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("x-api-key", key);
-    int code = http.POST((uint8_t *)body, (size_t)n);
-    http.end();
-    return code > 0 && code < 400;
-  }
-
-  // Captive portal: Bluetooth is shut down first so the two radios never compete.
-  void runPortal() {
-    tele->wifiState = NET_PORTAL;
-    btReleaseReq = true;                                           // obdTask drops Bluetooth
-    for (uint32_t t0 = millis(); !btReleased && millis() - t0 < 12000;) vTaskDelay(pdMS_TO_TICKS(50));
-
-    WiFi.disconnect(true, false);                                  // radio off, saved credentials kept
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    WiFiManager wm;
-    WiFiManagerParameter pUrl("url", "Backend URL", url, sizeof url - 1);
-    WiFiManagerParameter pKey("key", "API key", key, sizeof key - 1);
-    wm.addParameter(&pUrl);
-    wm.addParameter(&pKey);
-    wm.setConfigPortalTimeout(180);                                // give up after 3 minutes
-    wm.setConnectTimeout(20);
-    wm.setBreakAfterConfig(true);
-    wm.startConfigPortal(PORTAL_AP_NAME);                          // blocks THIS task until saved / timed out
-    saveNetConfig(pUrl.getValue(), pKey.getValue());
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();                                                  // resume with whatever is stored
-    portalReq = false;
-    btReleaseReq = false;                                          // obdTask restarts Bluetooth
-  }
-
-  void loadNetConfig() {
-    Preferences p;
-    p.begin("net", true);
-    p.getString("url", BACKEND_URL_DEFAULT).toCharArray(url, sizeof url);
-    p.getString("key", BACKEND_KEY_DEFAULT).toCharArray(key, sizeof key);
-    p.end();
-  }
-
-  void saveNetConfig(const char *u, const char *k) {
-    if (u && *u) strlcpy(url, u, sizeof url);
-    if (k && *k) strlcpy(key, k, sizeof key);
-    Preferences p;
-    p.begin("net", false);
-    p.putString("url", url);
-    p.putString("key", key);
-    p.end();
+    telemetry.rpm += simDirection;
+    if (telemetry.rpm >= 7600) simDirection = -110;
+    if (telemetry.rpm <= 800) simDirection = 85;
+    telemetry.speed = ((telemetry.rpm / 45) * config.speedCorrPct) / 100;
+    telemetry.coolant = 86 + (telemetry.rpm / 600);
+    telemetry.intake = 32 + (telemetry.rpm / 1000);
+    telemetry.throttle = map(telemetry.rpm, 800, 8000, 5, 98);
+    telemetry.load = map(telemetry.rpm, 800, 8000, 14, 95);
+    telemetry.maf = telemetry.rpm * 0.015f;
+    telemetry.timing = 12.5f + (telemetry.rpm / 500.0f);
+    telemetry.stft = -1.5f + sinf(millis() / 1000.0f) * 3.0f;
+    telemetry.ltft = 2.3f;
   }
 };
